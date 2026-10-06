@@ -1,1 +1,0 @@
-sqlplus cafeteria_app/"caferetia123"@localhost:1521/FREEPDB1
