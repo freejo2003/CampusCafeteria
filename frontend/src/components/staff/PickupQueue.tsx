@@ -21,12 +21,6 @@ function getNextStatus(status: string) {
   return null;
 }
 
-function getActionLabel(status: string) {
-  if (status === "PLACED") return "Start Preparing";
-  if (status === "PREPARING") return "Mark Ready";
-  if (status === "READY") return "Mark Collected";
-  return "";
-}
 
 function PickupQueue({
   pickupWindows,
@@ -200,3 +194,4 @@ function PickupQueue({
 }
 
 export default PickupQueue;
+
