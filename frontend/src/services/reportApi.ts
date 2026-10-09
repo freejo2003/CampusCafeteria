@@ -1,3 +1,5 @@
+import { API_BASE } from "../constants/config";
+
 export interface DailyOrderSummary {
   orderDate: string;
   totalOrders: number;
@@ -35,8 +37,6 @@ export interface ReportData {
   menuStock: MenuStockStatus[];
   orderDetails: OrderDetail[];
 }
-
-const API_BASE = "http://localhost:3000/api";
 
 async function request<T>(
   token: string,
