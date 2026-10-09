@@ -1,5 +1,3 @@
-import express from "express";
-import oracledb from "oracledb";
 import { Router } from "express";
 import { pool } from "../db.js";
 import {
@@ -47,6 +45,10 @@ function isValidDate(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}$/.test(value);
 }
 
+function isValidTime(value: string): boolean {
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+}
+
 /*
  * --------------------------------------------------------------------------
  * STUDENT / STAFF / ADMIN - PUBLISHED MENU
@@ -58,8 +60,6 @@ router.get(
   authenticateToken,
   requireRole("STUDENT", "STAFF", "ADMIN"),
   async (req, res) => {
-    let connection;
-
     try {
       const date = String(req.query.date ?? "");
 
@@ -69,35 +69,32 @@ router.get(
         });
       }
 
-      connection = await pool.getConnection();
-
-      const menuResult = await connection.execute<MenuItemRow>(
+      const menuResult = await pool.query(
         `
         SELECT
-            mi.menu_item_id AS "menuItemId",
-            mi.item_name AS "itemName",
-            mi.description AS "description",
-            mi.price AS "price",
-            mi.is_available AS "isAvailable",
-            NVL(s.available_qty, 0) AS "stockQuantity"
+          mi.menu_item_id AS "menuItemId",
+          mi.item_name AS "itemName",
+          mi.description AS "description",
+          mi.price AS "price",
+          mi.is_available AS "isAvailable",
+          COALESCE(s.available_qty, 0) AS "stockQuantity"
         FROM menu_dates md
         JOIN menu_items mi
           ON mi.menu_date_id = md.menu_date_id
         LEFT JOIN stock s
           ON s.menu_item_id = mi.menu_item_id
-        WHERE md.menu_date = TO_DATE(:menu_date, 'YYYY-MM-DD')
+        WHERE md.menu_date = $1::date
           AND md.is_published = 'Y'
         ORDER BY mi.menu_item_id
         `,
-        { menu_date: date },
-        { outFormat: 4002 },
+        [date],
       );
 
-      const ingredientResult = await connection.execute<IngredientRow>(
+      const ingredientResult = await pool.query(
         `
         SELECT
-            ii.menu_item_id AS "menuItemId",
-            i.ingredient_name AS "ingredientName"
+          ii.menu_item_id AS "menuItemId",
+          i.ingredient_name AS "ingredientName"
         FROM item_ingredients ii
         JOIN ingredients i
           ON i.ingredient_id = ii.ingredient_id
@@ -105,33 +102,31 @@ router.get(
           ON mi.menu_item_id = ii.menu_item_id
         JOIN menu_dates md
           ON md.menu_date_id = mi.menu_date_id
-        WHERE md.menu_date = TO_DATE(:menu_date, 'YYYY-MM-DD')
+        WHERE md.menu_date = $1::date
         ORDER BY ii.menu_item_id, i.ingredient_name
         `,
-        { menu_date: date },
-        { outFormat: 4002 },
+        [date],
       );
 
-      const pickupResult = await connection.execute<PickupWindowRow>(
+      const pickupResult = await pool.query(
         `
         SELECT
-            pickup_window_id AS "pickupWindowId",
-            TO_CHAR(start_time, 'HH24:MI') AS "startTime",
-            TO_CHAR(end_time, 'HH24:MI') AS "endTime",
-            capacity AS "capacity",
-            reserved_count AS "reservedCount",
-            capacity - reserved_count AS "availableCapacity"
+          pickup_window_id AS "pickupWindowId",
+          TO_CHAR(start_time, 'HH24:MI') AS "startTime",
+          TO_CHAR(end_time, 'HH24:MI') AS "endTime",
+          capacity AS "capacity",
+          reserved_count AS "reservedCount",
+          capacity - reserved_count AS "availableCapacity"
         FROM pickup_windows
-        WHERE window_date = TO_DATE(:menu_date, 'YYYY-MM-DD')
+        WHERE window_date = $1::date
         ORDER BY start_time
         `,
-        { menu_date: date },
-        { outFormat: 4002 },
+        [date],
       );
 
       const ingredientsByItem = new Map<number, string[]>();
 
-      for (const ingredient of ingredientResult.rows ?? []) {
+      for (const ingredient of ingredientResult.rows as IngredientRow[]) {
         if (!ingredientsByItem.has(ingredient.menuItemId)) {
           ingredientsByItem.set(ingredient.menuItemId, []);
         }
@@ -141,15 +136,22 @@ router.get(
           .push(ingredient.ingredientName);
       }
 
-      const items = (menuResult.rows ?? []).map((item) => ({
+      const items = (menuResult.rows as MenuItemRow[]).map((item) => ({
         ...item,
+        price: Number(item.price),
+        stockQuantity: Number(item.stockQuantity ?? 0),
         ingredients: ingredientsByItem.get(item.menuItemId) ?? [],
       }));
 
       return res.json({
         date,
         items,
-        pickupWindows: pickupResult.rows ?? [],
+        pickupWindows: pickupResult.rows.map((row) => ({
+          ...row,
+          capacity: Number(row.capacity),
+          reservedCount: Number(row.reservedCount),
+          availableCapacity: Number(row.availableCapacity),
+        })),
       });
     } catch (error) {
       console.error("Menu API error:", error);
@@ -157,10 +159,6 @@ router.get(
       return res.status(500).json({
         error: "Failed to retrieve menu.",
       });
-    } finally {
-      if (connection) {
-        await connection.close();
-      }
     }
   },
 );
@@ -176,33 +174,30 @@ router.get(
   authenticateToken,
   requireRole("ADMIN"),
   async (_req, res) => {
-    let connection;
-
     try {
-      connection = await pool.getConnection();
-
-      const result = await connection.execute(
+      const result = await pool.query(
         `
         SELECT
-            md.menu_date_id AS "menuDateId",
-            TO_CHAR(md.menu_date, 'YYYY-MM-DD') AS "menuDate",
-            md.is_published AS "isPublished",
-            COUNT(mi.menu_item_id) AS "itemCount"
+          md.menu_date_id AS "menuDateId",
+          TO_CHAR(md.menu_date, 'YYYY-MM-DD') AS "menuDate",
+          md.is_published AS "isPublished",
+          COUNT(mi.menu_item_id) AS "itemCount"
         FROM menu_dates md
         LEFT JOIN menu_items mi
           ON mi.menu_date_id = md.menu_date_id
         GROUP BY
-            md.menu_date_id,
-            md.menu_date,
-            md.is_published
+          md.menu_date_id,
+          md.menu_date,
+          md.is_published
         ORDER BY md.menu_date DESC
         `,
-        {},
-        { outFormat: 4002 },
       );
 
       return res.json({
-        dates: result.rows ?? [],
+        dates: result.rows.map((row) => ({
+          ...row,
+          itemCount: Number(row.itemCount),
+        })),
       });
     } catch (error) {
       console.error("Admin menu dates error:", error);
@@ -210,10 +205,6 @@ router.get(
       return res.status(500).json({
         error: "Failed to retrieve menu dates.",
       });
-    } finally {
-      if (connection) {
-        await connection.close();
-      }
     }
   },
 );
@@ -222,11 +213,6 @@ router.get(
  * --------------------------------------------------------------------------
  * ADMIN - CREATE MENU DATE
  * POST /api/menu/admin/dates
- * Body:
- * {
- *   "menuDate": "2026-10-06",
- *   "isPublished": "N"
- * }
  * --------------------------------------------------------------------------
  */
 router.post(
@@ -234,7 +220,7 @@ router.post(
   authenticateToken,
   requireRole("ADMIN"),
   async (req, res) => {
-    let connection;
+    const client = await pool.connect();
 
     try {
       const menuDate = String(req.body.menuDate ?? "");
@@ -254,70 +240,47 @@ router.post(
         });
       }
 
-      connection = await pool.getConnection();
+      await client.query("BEGIN");
 
-      const existing = await connection.execute(
+      const existing = await client.query(
         `
         SELECT menu_date_id
         FROM menu_dates
-        WHERE menu_date = TO_DATE(:menu_date, 'YYYY-MM-DD')
+        WHERE menu_date = $1::date
         `,
-        {
-          menu_date: menuDate,
-        },
-        {
-          outFormat: 4002,
-        },
+        [menuDate],
       );
 
-      if ((existing.rows ?? []).length > 0) {
+      if (existing.rows.length > 0) {
+        await client.query("ROLLBACK");
+
         return res.status(409).json({
           error: "A menu date already exists for this date.",
         });
       }
 
-      await connection.execute(
+      const created = await client.query(
         `
         INSERT INTO menu_dates (
           menu_date,
           is_published
         )
         VALUES (
-          TO_DATE(:menu_date, 'YYYY-MM-DD'),
-          :is_published
+          $1::date,
+          $2
         )
-        `,
-        {
-          menu_date: menuDate,
-          is_published: isPublished,
-        },
-      );
-
-      await connection.commit();
-
-      const created = await connection.execute(
-        `
-        SELECT
+        RETURNING
           menu_date_id AS "menuDateId",
           TO_CHAR(menu_date, 'YYYY-MM-DD') AS "menuDate",
           is_published AS "isPublished"
-        FROM menu_dates
-        WHERE menu_date = TO_DATE(:menu_date, 'YYYY-MM-DD')
         `,
-        {
-          menu_date: menuDate,
-        },
-        {
-          outFormat: 4002,
-        },
+        [menuDate, isPublished],
       );
 
-      const row = (created.rows ?? [])[0] as
-        | {
-          menuDateId: number;
-          menuDate: string;
-          isPublished: string;
-        }
+      await client.query("COMMIT");
+
+      const row = created.rows[0] as
+        | AdminMenuDateRow
         | undefined;
 
       if (!row) {
@@ -333,7 +296,7 @@ router.post(
         isPublished: row.isPublished,
       });
     } catch (error) {
-      await connection?.rollback();
+      await client.query("ROLLBACK");
 
       console.error("Create menu date error:", error);
 
@@ -341,9 +304,69 @@ router.post(
         error: "Failed to create menu date.",
       });
     } finally {
-      if (connection) {
-        await connection.close();
+      client.release();
+    }
+  },
+);
+
+/*
+ * --------------------------------------------------------------------------
+ * ADMIN - PUBLISH / UNPUBLISH MENU DATE
+ * PATCH /api/menu/admin/dates/:menuDateId
+ * --------------------------------------------------------------------------
+ */
+router.patch(
+  "/admin/dates/:menuDateId",
+  authenticateToken,
+  requireRole("ADMIN"),
+  async (req, res) => {
+    try {
+      const menuDateId = Number(req.params.menuDateId);
+      const isPublished = String(
+        req.body.isPublished ?? "",
+      ).toUpperCase();
+
+      if (!Number.isInteger(menuDateId) || menuDateId <= 0) {
+        return res.status(400).json({
+          error: "Invalid menu date ID.",
+        });
       }
+
+      if (!["Y", "N"].includes(isPublished)) {
+        return res.status(400).json({
+          error: "isPublished must be Y or N.",
+        });
+      }
+
+      const result = await pool.query(
+        `
+        UPDATE menu_dates
+        SET is_published = $1
+        WHERE menu_date_id = $2
+        `,
+        [isPublished, menuDateId],
+      );
+
+      if (result.rowCount !== 1) {
+        return res.status(404).json({
+          error: "Menu date not found.",
+        });
+      }
+
+      return res.json({
+        message:
+          isPublished === "Y"
+            ? "Menu published successfully."
+            : "Menu unpublished successfully.",
+        menuDateId,
+        isPublished,
+      });
+    } catch (error) {
+      console.error("Update menu publication error:", error);
+
+      return res.status(500).json({
+        error: "Failed to update menu publication status.",
+      });
     }
   },
 );
@@ -359,8 +382,6 @@ router.get(
   authenticateToken,
   requireRole("ADMIN"),
   async (req, res) => {
-    let connection;
-
     try {
       const date = String(req.query.date ?? "");
 
@@ -370,22 +391,19 @@ router.get(
         });
       }
 
-      connection = await pool.getConnection();
-
-      const dateResult = await connection.execute<AdminMenuDateRow>(
+      const dateResult = await pool.query(
         `
         SELECT
-            menu_date_id AS "menuDateId",
-            TO_CHAR(menu_date, 'YYYY-MM-DD') AS "menuDate",
-            is_published AS "isPublished"
+          menu_date_id AS "menuDateId",
+          TO_CHAR(menu_date, 'YYYY-MM-DD') AS "menuDate",
+          is_published AS "isPublished"
         FROM menu_dates
-        WHERE menu_date = TO_DATE(:menu_date, 'YYYY-MM-DD')
+        WHERE menu_date = $1::date
         `,
-        { menu_date: date },
-        { outFormat: 4002 },
+        [date],
       );
 
-      const menuDate = (dateResult.rows ?? [])[0];
+      const menuDate = dateResult.rows[0];
 
       if (!menuDate) {
         return res.status(404).json({
@@ -393,49 +411,43 @@ router.get(
         });
       }
 
-      const itemResult = await connection.execute<MenuItemRow>(
+      const itemResult = await pool.query(
         `
         SELECT
-            mi.menu_item_id AS "menuItemId",
-            mi.item_name AS "itemName",
-            mi.description AS "description",
-            mi.price AS "price",
-            mi.is_available AS "isAvailable",
-            NVL(s.available_qty, 0) AS "stockQuantity"
+          mi.menu_item_id AS "menuItemId",
+          mi.item_name AS "itemName",
+          mi.description AS "description",
+          mi.price AS "price",
+          mi.is_available AS "isAvailable",
+          COALESCE(s.available_qty, 0) AS "stockQuantity"
         FROM menu_items mi
         LEFT JOIN stock s
           ON s.menu_item_id = mi.menu_item_id
-        WHERE mi.menu_date_id = :menu_date_id
+        WHERE mi.menu_date_id = $1
         ORDER BY mi.menu_item_id
         `,
-        {
-          menu_date_id: menuDate.menuDateId,
-        },
-        { outFormat: 4002 },
+        [menuDate.menuDateId],
       );
 
-      const ingredientResult = await connection.execute<IngredientRow>(
+      const ingredientResult = await pool.query(
         `
         SELECT
-            ii.menu_item_id AS "menuItemId",
-            i.ingredient_name AS "ingredientName"
+          ii.menu_item_id AS "menuItemId",
+          i.ingredient_name AS "ingredientName"
         FROM item_ingredients ii
         JOIN ingredients i
           ON i.ingredient_id = ii.ingredient_id
         JOIN menu_items mi
           ON mi.menu_item_id = ii.menu_item_id
-        WHERE mi.menu_date_id = :menu_date_id
+        WHERE mi.menu_date_id = $1
         ORDER BY ii.menu_item_id, i.ingredient_name
         `,
-        {
-          menu_date_id: menuDate.menuDateId,
-        },
-        { outFormat: 4002 },
+        [menuDate.menuDateId],
       );
 
       const ingredientsByItem = new Map<number, string[]>();
 
-      for (const ingredient of ingredientResult.rows ?? []) {
+      for (const ingredient of ingredientResult.rows as IngredientRow[]) {
         if (!ingredientsByItem.has(ingredient.menuItemId)) {
           ingredientsByItem.set(ingredient.menuItemId, []);
         }
@@ -445,8 +457,10 @@ router.get(
           .push(ingredient.ingredientName);
       }
 
-      const items = (itemResult.rows ?? []).map((item) => ({
+      const items = (itemResult.rows as MenuItemRow[]).map((item) => ({
         ...item,
+        price: Number(item.price),
+        stockQuantity: Number(item.stockQuantity ?? 0),
         ingredients: ingredientsByItem.get(item.menuItemId) ?? [],
       }));
 
@@ -460,10 +474,6 @@ router.get(
       return res.status(500).json({
         error: "Failed to retrieve admin menu.",
       });
-    } finally {
-      if (connection) {
-        await connection.close();
-      }
     }
   },
 );
@@ -479,8 +489,6 @@ router.get(
   authenticateToken,
   requireRole("ADMIN"),
   async (req, res) => {
-    let connection;
-
     try {
       const date = String(req.query.date ?? "");
 
@@ -490,29 +498,22 @@ router.get(
         });
       }
 
-      connection = await pool.getConnection();
-
-      const dateCheck = await connection.execute(
+      const dateCheck = await pool.query(
         `
         SELECT menu_date_id
         FROM menu_dates
-        WHERE menu_date = TO_DATE(:menu_date, 'YYYY-MM-DD')
+        WHERE menu_date = $1::date
         `,
-        {
-          menu_date: date,
-        },
-        {
-          outFormat: oracledb.OUT_FORMAT_OBJECT,
-        },
+        [date],
       );
 
-      if ((dateCheck.rows ?? []).length === 0) {
+      if (dateCheck.rows.length === 0) {
         return res.status(404).json({
           error: "Menu date not found.",
         });
       }
 
-      const result = await connection.execute<PickupWindowRow>(
+      const result = await pool.query(
         `
         SELECT
           pickup_window_id AS "pickupWindowId",
@@ -522,20 +523,20 @@ router.get(
           reserved_count AS "reservedCount",
           capacity - reserved_count AS "availableCapacity"
         FROM pickup_windows
-        WHERE window_date = TO_DATE(:window_date, 'YYYY-MM-DD')
+        WHERE window_date = $1::date
         ORDER BY start_time
         `,
-        {
-          window_date: date,
-        },
-        {
-          outFormat: oracledb.OUT_FORMAT_OBJECT,
-        },
+        [date],
       );
 
       return res.json({
         date,
-        pickupWindows: result.rows ?? [],
+        pickupWindows: result.rows.map((row) => ({
+          ...row,
+          capacity: Number(row.capacity),
+          reservedCount: Number(row.reservedCount),
+          availableCapacity: Number(row.availableCapacity),
+        })),
       });
     } catch (error) {
       console.error("Admin pickup windows error:", error);
@@ -543,10 +544,6 @@ router.get(
       return res.status(500).json({
         error: "Failed to retrieve pickup windows.",
       });
-    } finally {
-      if (connection) {
-        await connection.close();
-      }
     }
   },
 );
@@ -556,7 +553,7 @@ router.post(
   authenticateToken,
   requireRole("ADMIN"),
   async (req, res) => {
-    let connection;
+    const client = await pool.connect();
 
     try {
       const menuDate = String(req.body.menuDate ?? "");
@@ -570,13 +567,13 @@ router.post(
         });
       }
 
-      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(startTime)) {
+      if (!isValidTime(startTime)) {
         return res.status(400).json({
           error: "startTime must use HH:MM format.",
         });
       }
 
-      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(endTime)) {
+      if (!isValidTime(endTime)) {
         return res.status(400).json({
           error: "endTime must use HH:MM format.",
         });
@@ -594,53 +591,45 @@ router.post(
         });
       }
 
-      connection = await pool.getConnection();
+      await client.query("BEGIN");
 
-      const dateCheck = await connection.execute(
+      const dateCheck = await client.query(
         `
         SELECT menu_date_id
         FROM menu_dates
-        WHERE menu_date = TO_DATE(:menu_date, 'YYYY-MM-DD')
+        WHERE menu_date = $1::date
         `,
-        {
-          menu_date: menuDate,
-        },
-        {
-          outFormat: oracledb.OUT_FORMAT_OBJECT,
-        },
+        [menuDate],
       );
 
-      if ((dateCheck.rows ?? []).length === 0) {
+      if (dateCheck.rows.length === 0) {
+        await client.query("ROLLBACK");
+
         return res.status(404).json({
           error: "Menu date not found. Create the menu date first.",
         });
       }
 
-      const overlap = await connection.execute(
+      const overlap = await client.query(
         `
         SELECT pickup_window_id
         FROM pickup_windows
-        WHERE window_date = TO_DATE(:window_date, 'YYYY-MM-DD')
-          AND start_time < TO_TIMESTAMP(:end_time, 'HH24:MI')
-          AND end_time > TO_TIMESTAMP(:start_time, 'HH24:MI')
+        WHERE window_date = $1::date
+          AND start_time < ($1::date + $3::time)
+          AND end_time > ($1::date + $2::time)
         `,
-        {
-          window_date: menuDate,
-          start_time: startTime,
-          end_time: endTime,
-        },
-        {
-          outFormat: oracledb.OUT_FORMAT_OBJECT,
-        },
+        [menuDate, startTime, endTime],
       );
 
-      if ((overlap.rows ?? []).length > 0) {
+      if (overlap.rows.length > 0) {
+        await client.query("ROLLBACK");
+
         return res.status(409).json({
           error: "Pickup window overlaps an existing window for this date.",
         });
       }
 
-      const result = await connection.execute(
+      const result = await client.query(
         `
         INSERT INTO pickup_windows (
           window_date,
@@ -650,35 +639,31 @@ router.post(
           reserved_count
         )
         VALUES (
-          TO_DATE(:window_date, 'YYYY-MM-DD'),
-          TO_TIMESTAMP(:start_time, 'HH24:MI'),
-          TO_TIMESTAMP(:end_time, 'HH24:MI'),
-          :capacity,
+          $1::date,
+          $1::date + $2::time,
+          $1::date + $3::time,
+          $4,
           0
         )
-        RETURNING pickup_window_id INTO :pickup_window_id
+        RETURNING pickup_window_id
         `,
-        {
-          window_date: menuDate,
-          start_time: startTime,
-          end_time: endTime,
+        [
+          menuDate,
+          startTime,
+          endTime,
           capacity,
-          pickup_window_id: {
-            dir: oracledb.BIND_OUT,
-            type: oracledb.NUMBER,
-          },
-        },
+        ],
       );
 
-      await connection.commit();
+      await client.query("COMMIT");
 
-      const outBinds = result.outBinds as {
-        pickup_window_id: number[];
-      };
+      const pickupWindowId = Number(
+        result.rows[0].pickup_window_id,
+      );
 
       return res.status(201).json({
         message: "Pickup window created successfully.",
-        pickupWindowId: Number(outBinds.pickup_window_id[0]),
+        pickupWindowId,
         menuDate,
         startTime,
         endTime,
@@ -687,16 +672,15 @@ router.post(
         availableCapacity: capacity,
       });
     } catch (error) {
-      await connection?.rollback();
+      await client.query("ROLLBACK");
+
       console.error("Create pickup window error:", error);
 
       return res.status(500).json({
         error: "Failed to create pickup window.",
       });
     } finally {
-      if (connection) {
-        await connection.close();
-      }
+      client.release();
     }
   },
 );
@@ -706,7 +690,7 @@ router.patch(
   authenticateToken,
   requireRole("ADMIN"),
   async (req, res) => {
-    let connection;
+    const client = await pool.connect();
 
     try {
       const pickupWindowId = Number(req.params.pickupWindowId);
@@ -720,13 +704,13 @@ router.patch(
         });
       }
 
-      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(startTime)) {
+      if (!isValidTime(startTime)) {
         return res.status(400).json({
           error: "startTime must use HH:MM format.",
         });
       }
 
-      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(endTime)) {
+      if (!isValidTime(endTime)) {
         return res.status(400).json({
           error: "endTime must use HH:MM format.",
         });
@@ -744,100 +728,91 @@ router.patch(
         });
       }
 
-      connection = await pool.getConnection();
+      await client.query("BEGIN");
 
-      const currentResult = await connection.execute(
+      const currentResult = await client.query(
         `
         SELECT
           pickup_window_id,
           reserved_count,
           TO_CHAR(window_date, 'YYYY-MM-DD') AS window_date
         FROM pickup_windows
-        WHERE pickup_window_id = :pickup_window_id
+        WHERE pickup_window_id = $1
         FOR UPDATE
         `,
-        {
-          pickup_window_id: pickupWindowId,
-        },
-        {
-          outFormat: oracledb.OUT_FORMAT_OBJECT,
-        },
+        [pickupWindowId],
       );
 
-      const current = (currentResult.rows ?? [])[0] as
-        | {
-            PICKUP_WINDOW_ID?: number;
-            RESERVED_COUNT?: number;
-            WINDOW_DATE?: string;
-            pickup_window_id?: number;
-            reserved_count?: number;
-            window_date?: string;
-          }
-        | undefined;
+      const current = currentResult.rows[0];
 
       if (!current) {
+        await client.query("ROLLBACK");
+
         return res.status(404).json({
           error: "Pickup window not found.",
         });
       }
 
       const reservedCount = Number(
-        current.RESERVED_COUNT ?? current.reserved_count ?? 0,
+        current.reserved_count ?? 0,
       );
+
       const windowDate = String(
-        current.WINDOW_DATE ?? current.window_date ?? "",
+        current.window_date ?? "",
       );
 
       if (capacity < reservedCount) {
+        await client.query("ROLLBACK");
+
         return res.status(409).json({
           error: `Capacity cannot be reduced below the ${reservedCount} already reserved orders.`,
         });
       }
 
-      const overlap = await connection.execute(
+      const overlap = await client.query(
         `
         SELECT pickup_window_id
         FROM pickup_windows
-        WHERE window_date = TO_DATE(:window_date, 'YYYY-MM-DD')
-          AND pickup_window_id <> :pickup_window_id
-          AND start_time < TO_TIMESTAMP(:end_time, 'HH24:MI')
-          AND end_time > TO_TIMESTAMP(:start_time, 'HH24:MI')
+        WHERE window_date = $1::date
+          AND pickup_window_id <> $2
+          AND start_time < ($1::date + $4::time)
+          AND end_time > ($1::date + $3::time)
         `,
-        {
-          window_date: windowDate,
-          pickup_window_id: pickupWindowId,
-          start_time: startTime,
-          end_time: endTime,
-        },
-        {
-          outFormat: oracledb.OUT_FORMAT_OBJECT,
-        },
+        [
+          windowDate,
+          pickupWindowId,
+          startTime,
+          endTime,
+        ],
       );
 
-      if ((overlap.rows ?? []).length > 0) {
+      if (overlap.rows.length > 0) {
+        await client.query("ROLLBACK");
+
         return res.status(409).json({
           error: "Pickup window overlaps another window for this date.",
         });
       }
 
-      await connection.execute(
+      await client.query(
         `
         UPDATE pickup_windows
         SET
-          start_time = TO_TIMESTAMP(:start_time, 'HH24:MI'),
-          end_time = TO_TIMESTAMP(:end_time, 'HH24:MI'),
-          capacity = :capacity
-        WHERE pickup_window_id = :pickup_window_id
+          start_time = $2::date + $3::time,
+          end_time = $2::date + $4::time,
+          capacity = $5
+        WHERE pickup_window_id = $1
         `,
-        {
-          start_time: startTime,
-          end_time: endTime,
+        [
+          pickupWindowId,
+          windowDate,
+          startTime,
+          endTime,
           capacity,
-          pickup_window_id: pickupWindowId,
-        },
+        ],
       );
 
-      await connection.commit();
+      await client.query("COMMIT");
 
       return res.json({
         message: "Pickup window updated successfully.",
@@ -850,16 +825,15 @@ router.patch(
         availableCapacity: capacity - reservedCount,
       });
     } catch (error) {
-      await connection?.rollback();
+      await client.query("ROLLBACK");
+
       console.error("Update pickup window error:", error);
 
       return res.status(500).json({
         error: "Failed to update pickup window.",
       });
     } finally {
-      if (connection) {
-        await connection.close();
-      }
+      client.release();
     }
   },
 );
@@ -869,7 +843,7 @@ router.delete(
   authenticateToken,
   requireRole("ADMIN"),
   async (req, res) => {
-    let connection;
+    const client = await pool.connect();
 
     try {
       const pickupWindowId = Number(req.params.pickupWindowId);
@@ -880,73 +854,65 @@ router.delete(
         });
       }
 
-      connection = await pool.getConnection();
+      await client.query("BEGIN");
 
-      const currentResult = await connection.execute(
+      const currentResult = await client.query(
         `
         SELECT reserved_count
         FROM pickup_windows
-        WHERE pickup_window_id = :pickup_window_id
+        WHERE pickup_window_id = $1
+        FOR UPDATE
         `,
-        {
-          pickup_window_id: pickupWindowId,
-        },
-        {
-          outFormat: oracledb.OUT_FORMAT_OBJECT,
-        },
+        [pickupWindowId],
       );
 
-      const current = (currentResult.rows ?? [])[0] as
-        | {
-            RESERVED_COUNT?: number;
-            reserved_count?: number;
-          }
-        | undefined;
+      const current = currentResult.rows[0];
 
       if (!current) {
+        await client.query("ROLLBACK");
+
         return res.status(404).json({
           error: "Pickup window not found.",
         });
       }
 
       const reservedCount = Number(
-        current.RESERVED_COUNT ?? current.reserved_count ?? 0,
+        current.reserved_count ?? 0,
       );
 
       if (reservedCount > 0) {
+        await client.query("ROLLBACK");
+
         return res.status(409).json({
           error:
             `This pickup window cannot be deleted because ${reservedCount} order(s) are already reserved in it.`,
         });
       }
 
-      await connection.execute(
+      await client.query(
         `
         DELETE FROM pickup_windows
-        WHERE pickup_window_id = :pickup_window_id
+        WHERE pickup_window_id = $1
         `,
-        {
-          pickup_window_id: pickupWindowId,
-        },
+        [pickupWindowId],
       );
 
-      await connection.commit();
+      await client.query("COMMIT");
 
       return res.json({
         message: "Pickup window deleted successfully.",
         pickupWindowId,
       });
     } catch (error) {
-      await connection?.rollback();
+      await client.query("ROLLBACK");
+
       console.error("Delete pickup window error:", error);
 
       return res.status(500).json({
         error: "Failed to delete pickup window.",
       });
     } finally {
-      if (connection) {
-        await connection.close();
-      }
+      client.release();
     }
   },
 );
@@ -962,25 +928,19 @@ router.get(
   authenticateToken,
   requireRole("ADMIN"),
   async (_req, res) => {
-    let connection;
-
     try {
-      connection = await pool.getConnection();
-
-      const result = await connection.execute<IngredientCatalogRow>(
+      const result = await pool.query(
         `
         SELECT
-            ingredient_id AS "ingredientId",
-            ingredient_name AS "ingredientName"
+          ingredient_id AS "ingredientId",
+          ingredient_name AS "ingredientName"
         FROM ingredients
         ORDER BY ingredient_name
         `,
-        {},
-        { outFormat: 4002 },
       );
 
       return res.json({
-        ingredients: result.rows ?? [],
+        ingredients: result.rows as IngredientCatalogRow[],
       });
     } catch (error) {
       console.error("Ingredient catalog error:", error);
@@ -988,10 +948,6 @@ router.get(
       return res.status(500).json({
         error: "Failed to retrieve ingredients.",
       });
-    } finally {
-      if (connection) {
-        await connection.close();
-      }
     }
   },
 );
@@ -1000,10 +956,6 @@ router.get(
  * --------------------------------------------------------------------------
  * ADMIN - CREATE INGREDIENT
  * POST /api/menu/admin/ingredients
- * Body:
- * {
- *   "ingredientName": "Garlic"
- * }
  * --------------------------------------------------------------------------
  */
 router.post(
@@ -1011,7 +963,7 @@ router.post(
   authenticateToken,
   requireRole("ADMIN"),
   async (req, res) => {
-    let connection;
+    const client = await pool.connect();
 
     try {
       const ingredientName = String(
@@ -1030,65 +982,55 @@ router.post(
         });
       }
 
-      connection = await pool.getConnection();
+      await client.query("BEGIN");
 
-      const duplicate = await connection.execute(
+      const duplicate = await client.query(
         `
         SELECT ingredient_id
         FROM ingredients
-        WHERE UPPER(ingredient_name) = UPPER(:ingredient_name)
+        WHERE UPPER(ingredient_name) = UPPER($1)
         `,
-        { ingredient_name: ingredientName },
-        { outFormat: 4002 },
+        [ingredientName],
       );
 
-      if ((duplicate.rows ?? []).length > 0) {
+      if (duplicate.rows.length > 0) {
+        await client.query("ROLLBACK");
+
         return res.status(409).json({
           error: "Ingredient already exists.",
         });
       }
 
-      const result = await connection.execute(
+      const result = await client.query(
         `
         INSERT INTO ingredients (
           ingredient_name
         )
         VALUES (
-          :ingredient_name
+          $1
         )
-        RETURNING ingredient_id INTO :ingredient_id
+        RETURNING ingredient_id
         `,
-        {
-          ingredient_name: ingredientName,
-          ingredient_id: {
-            dir: oracledb.BIND_OUT,
-            type: oracledb.NUMBER,
-          },
-        },
+        [ingredientName],
       );
 
-      await connection.commit();
-
-      const outBinds = result.outBinds as {
-        ingredient_id: number[];
-      };
+      await client.query("COMMIT");
 
       return res.status(201).json({
         message: "Ingredient created successfully.",
-        ingredientId: Number(outBinds.ingredient_id[0]),
+        ingredientId: Number(result.rows[0].ingredient_id),
         ingredientName,
       });
     } catch (error) {
-      await connection?.rollback();
+      await client.query("ROLLBACK");
+
       console.error("Create ingredient error:", error);
 
       return res.status(500).json({
         error: "Failed to create ingredient.",
       });
     } finally {
-      if (connection) {
-        await connection.close();
-      }
+      client.release();
     }
   },
 );
@@ -1097,17 +1039,6 @@ router.post(
  * --------------------------------------------------------------------------
  * ADMIN - CREATE MENU ITEM
  * POST /api/menu/admin/items
- *
- * Body:
- * {
- *   menuDateId: 1,
- *   itemName: "Chicken Biryani",
- *   description: "...",
- *   price: 120,
- *   isAvailable: "Y",
- *   stockQuantity: 50,
- *   ingredientIds: [1, 2, 3]
- * }
  * --------------------------------------------------------------------------
  */
 router.post(
@@ -1115,7 +1046,7 @@ router.post(
   authenticateToken,
   requireRole("ADMIN"),
   async (req, res) => {
-    let connection;
+    const client = await pool.connect();
 
     try {
       const menuDateId = Number(req.body.menuDateId);
@@ -1126,6 +1057,7 @@ router.post(
         req.body.isAvailable ?? "Y",
       ).toUpperCase();
       const stockQuantity = Number(req.body.stockQuantity ?? 0);
+
       const ingredientIds: number[] = Array.isArray(
         req.body.ingredientIds,
       )
@@ -1182,137 +1114,126 @@ router.post(
         });
       }
 
-      connection = await pool.getConnection();
+      await client.query("BEGIN");
 
-      const dateCheck = await connection.execute(
+      const dateCheck = await client.query(
         `
         SELECT menu_date_id
         FROM menu_dates
-        WHERE menu_date_id = :menu_date_id
+        WHERE menu_date_id = $1
         `,
-        { menu_date_id: menuDateId },
-        { outFormat: 4002 },
+        [menuDateId],
       );
 
-      if ((dateCheck.rows ?? []).length === 0) {
+      if (dateCheck.rows.length === 0) {
+        await client.query("ROLLBACK");
+
         return res.status(404).json({
           error: "Menu date not found.",
         });
       }
 
-      const duplicate = await connection.execute(
+      const duplicate = await client.query(
         `
         SELECT menu_item_id
         FROM menu_items
-        WHERE menu_date_id = :menu_date_id
-          AND UPPER(item_name) = UPPER(:item_name)
+        WHERE menu_date_id = $1
+          AND UPPER(item_name) = UPPER($2)
         `,
-        {
-          menu_date_id: menuDateId,
-          item_name: itemName,
-        },
-        { outFormat: 4002 },
+        [menuDateId, itemName],
       );
 
-      if ((duplicate.rows ?? []).length > 0) {
+      if (duplicate.rows.length > 0) {
+        await client.query("ROLLBACK");
+
         return res.status(409).json({
           error: "A menu item with this name already exists for this date.",
         });
       }
 
-      const itemResult = await connection.execute(
+      const itemResult = await client.query(
         `
-  INSERT INTO menu_items (
-    menu_date_id,
-    item_name,
-    description,
-    price,
-    is_available
-  )
-  VALUES (
-    :menu_date_id,
-    :item_name,
-    :description,
-    :price,
-    :is_available
-  )
-  RETURNING menu_item_id INTO :menu_item_id
-  `,
-        {
-          menu_date_id: menuDateId,
-          item_name: itemName,
+        INSERT INTO menu_items (
+          menu_date_id,
+          item_name,
           description,
           price,
-          is_available: isAvailable,
-          menu_item_id: {
-            dir: oracledb.BIND_OUT,
-            type: oracledb.NUMBER,
-          },
-        },
+          is_available
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5
+        )
+        RETURNING menu_item_id
+        `,
+        [
+          menuDateId,
+          itemName,
+          description,
+          price,
+          isAvailable,
+        ],
       );
-      const itemOutBinds = itemResult.outBinds as {
-        menu_item_id: number[];
-      };
 
-      const menuItemId = Number(itemOutBinds.menu_item_id[0]);
+      const menuItemId = Number(
+        itemResult.rows[0].menu_item_id,
+      );
 
-      await connection.execute(
+      await client.query(
         `
         INSERT INTO stock (
           menu_item_id,
           available_qty
         )
         VALUES (
-          :menu_item_id,
-          :available_qty
+          $1,
+          $2
         )
         `,
-        {
-          menu_item_id: menuItemId,
-          available_qty: stockQuantity,
-        },
+        [
+          menuItemId,
+          stockQuantity,
+        ],
       );
 
       for (const ingredientId of ingredientIds) {
-        if (!Number.isInteger(ingredientId) || ingredientId <= 0) {
-          continue;
-        }
-
-        await connection.execute(
+        await client.query(
           `
           INSERT INTO item_ingredients (
             menu_item_id,
             ingredient_id
           )
           VALUES (
-            :menu_item_id,
-            :ingredient_id
+            $1,
+            $2
           )
           `,
-          {
-            menu_item_id: menuItemId,
-            ingredient_id: ingredientId,
-          },
+          [
+            menuItemId,
+            ingredientId,
+          ],
         );
       }
 
-      await connection.commit();
+      await client.query("COMMIT");
 
       return res.status(201).json({
         message: "Menu item created successfully.",
         menuItemId,
       });
     } catch (error) {
-      await connection?.rollback();
+      await client.query("ROLLBACK");
+
       console.error("Create menu item error:", error);
 
       return res.status(500).json({
         error: "Failed to create menu item.",
       });
     } finally {
-      if (connection) {
-        await connection.close();
-      }
+      client.release();
     }
   },
 );
@@ -1328,23 +1249,20 @@ router.patch(
   authenticateToken,
   requireRole("ADMIN"),
   async (req, res) => {
-    let connection;
-
     try {
       const menuItemId = Number(req.params.menuItemId);
-
-      if (!Number.isInteger(menuItemId) || menuItemId <= 0) {
-        return res.status(400).json({
-          error: "Invalid menu item ID.",
-        });
-      }
-
       const itemName = String(req.body.itemName ?? "").trim();
       const description = String(req.body.description ?? "").trim();
       const price = Number(req.body.price);
       const isAvailable = String(
         req.body.isAvailable ?? "Y",
       ).toUpperCase();
+
+      if (!Number.isInteger(menuItemId) || menuItemId <= 0) {
+        return res.status(400).json({
+          error: "Invalid menu item ID.",
+        });
+      }
 
       if (!itemName) {
         return res.status(400).json({
@@ -1364,50 +1282,41 @@ router.patch(
         });
       }
 
-      connection = await pool.getConnection();
-
-      const result = await connection.execute(
+      const result = await pool.query(
         `
         UPDATE menu_items
         SET
-          item_name = :item_name,
-          description = :description,
-          price = :price,
-          is_available = :is_available
-        WHERE menu_item_id = :menu_item_id
+          item_name = $1,
+          description = $2,
+          price = $3,
+          is_available = $4
+        WHERE menu_item_id = $5
         `,
-        {
-          item_name: itemName,
+        [
+          itemName,
           description,
           price,
-          is_available: isAvailable,
-          menu_item_id: menuItemId,
-        },
+          isAvailable,
+          menuItemId,
+        ],
       );
 
-      if ((result.rowsAffected ?? 0) === 0) {
+      if (result.rowCount !== 1) {
         return res.status(404).json({
           error: "Menu item not found.",
         });
       }
-
-      await connection.commit();
 
       return res.json({
         message: "Menu item updated successfully.",
         menuItemId,
       });
     } catch (error) {
-      await connection?.rollback();
       console.error("Update menu item error:", error);
 
       return res.status(500).json({
         error: "Failed to update menu item.",
       });
-    } finally {
-      if (connection) {
-        await connection.close();
-      }
     }
   },
 );
@@ -1423,8 +1332,6 @@ router.put(
   authenticateToken,
   requireRole("ADMIN"),
   async (req, res) => {
-    let connection;
-
     try {
       const menuItemId = Number(req.params.menuItemId);
       const availableQty = Number(req.body.availableQty);
@@ -1444,27 +1351,23 @@ router.put(
         });
       }
 
-      connection = await pool.getConnection();
-
-      const result = await connection.execute(
+      const result = await pool.query(
         `
         UPDATE stock
-        SET available_qty = :available_qty
-        WHERE menu_item_id = :menu_item_id
+        SET available_qty = $1
+        WHERE menu_item_id = $2
         `,
-        {
-          available_qty: availableQty,
-          menu_item_id: menuItemId,
-        },
+        [
+          availableQty,
+          menuItemId,
+        ],
       );
 
-      if ((result.rowsAffected ?? 0) === 0) {
+      if (result.rowCount !== 1) {
         return res.status(404).json({
           error: "Stock record not found for this menu item.",
         });
       }
-
-      await connection.commit();
 
       return res.json({
         message: "Stock updated successfully.",
@@ -1472,16 +1375,11 @@ router.put(
         availableQty,
       });
     } catch (error) {
-      await connection?.rollback();
       console.error("Update stock error:", error);
 
       return res.status(500).json({
         error: "Failed to update stock.",
       });
-    } finally {
-      if (connection) {
-        await connection.close();
-      }
     }
   },
 );
@@ -1490,10 +1388,6 @@ router.put(
  * --------------------------------------------------------------------------
  * ADMIN - REPLACE INGREDIENT ASSIGNMENTS
  * PUT /api/menu/admin/items/:menuItemId/ingredients
- * Body:
- * {
- *   "ingredientIds": [1, 2, 3]
- * }
  * --------------------------------------------------------------------------
  */
 router.put(
@@ -1501,7 +1395,7 @@ router.put(
   authenticateToken,
   requireRole("ADMIN"),
   async (req, res) => {
-    let connection;
+    const client = await pool.connect();
 
     try {
       const menuItemId = Number(req.params.menuItemId);
@@ -1511,62 +1405,50 @@ router.put(
           error: "Invalid menu item ID.",
         });
       }
-
-      const ingredientIds: number[] = Array.isArray(
-        req.body.ingredientIds,
-      )
-        ? req.body.ingredientIds
-          .map(Number)
-          .filter(
-            (id: number) =>
-              Number.isInteger(id) && id > 0,
-          )
+      const ingredientIds: number[] = Array.isArray(req.body.ingredientIds)
+        ? [
+          ...new Set(
+            (req.body.ingredientIds as unknown[])
+              .map((value): number => Number(value))
+              .filter(
+                (id: number) => Number.isInteger(id) && id > 0,
+              ),
+          ),
+        ]
         : [];
 
-      connection = await pool.getConnection();
+      await client.query("BEGIN");
 
-      const menuItemResult = await connection.execute(
+      const menuItemResult = await client.query(
         `
         SELECT menu_item_id
         FROM menu_items
-        WHERE menu_item_id = :menu_item_id
+        WHERE menu_item_id = $1
         `,
-        {
-          menu_item_id: menuItemId,
-        },
-        {
-          outFormat: 4002,
-        },
+        [menuItemId],
       );
 
-      if ((menuItemResult.rows ?? []).length === 0) {
+      if (menuItemResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+
         return res.status(404).json({
           error: "Menu item not found.",
         });
       }
 
       if (ingredientIds.length > 0) {
-        const ingredientResult =
-          await connection.execute(
-            `
-            SELECT ingredient_id
-            FROM ingredients
-            WHERE ingredient_id IN (
-              SELECT COLUMN_VALUE
-              FROM TABLE(
-                SYS.ODCINUMBERLIST(${ingredientIds.join(",")})
-              )
-            )
-            `,
-            {},
-            {
-              outFormat: 4002,
-            },
-          );
+        const ingredientResult = await client.query(
+          `
+          SELECT ingredient_id
+          FROM ingredients
+          WHERE ingredient_id = ANY($1::INTEGER[])
+          `,
+          [ingredientIds],
+        );
 
         const existingIngredientIds = new Set(
-          (ingredientResult.rows ?? []).map(
-            (row: any) => Number(row.ingredient_id),
+          ingredientResult.rows.map(
+            (row) => Number(row.ingredient_id),
           ),
         );
 
@@ -1576,6 +1458,8 @@ router.put(
           );
 
         if (invalidIngredientIds.length > 0) {
+          await client.query("ROLLBACK");
+
           return res.status(400).json({
             error: "One or more ingredient IDs do not exist.",
             invalidIngredientIds,
@@ -1583,36 +1467,34 @@ router.put(
         }
       }
 
-      await connection.execute(
+      await client.query(
         `
         DELETE FROM item_ingredients
-        WHERE menu_item_id = :menu_item_id
+        WHERE menu_item_id = $1
         `,
-        {
-          menu_item_id: menuItemId,
-        },
+        [menuItemId],
       );
 
       for (const ingredientId of ingredientIds) {
-        await connection.execute(
+        await client.query(
           `
           INSERT INTO item_ingredients (
             menu_item_id,
             ingredient_id
           )
           VALUES (
-            :menu_item_id,
-            :ingredient_id
+            $1,
+            $2
           )
           `,
-          {
-            menu_item_id: menuItemId,
-            ingredient_id: ingredientId,
-          },
+          [
+            menuItemId,
+            ingredientId,
+          ],
         );
       }
 
-      await connection.commit();
+      await client.query("COMMIT");
 
       return res.json({
         message:
@@ -1621,7 +1503,7 @@ router.put(
         ingredientIds,
       });
     } catch (error) {
-      await connection?.rollback();
+      await client.query("ROLLBACK");
 
       console.error(
         "Update ingredients error:",
@@ -1633,9 +1515,7 @@ router.put(
           "Failed to update ingredient assignments.",
       });
     } finally {
-      if (connection) {
-        await connection.close();
-      }
+      client.release();
     }
   },
 );
@@ -1651,7 +1531,7 @@ router.delete(
   authenticateToken,
   requireRole("ADMIN"),
   async (req, res) => {
-    let connection;
+    const client = await pool.connect();
 
     try {
       const menuItemId = Number(req.params.menuItemId);
@@ -1662,26 +1542,21 @@ router.delete(
         });
       }
 
-      connection = await pool.getConnection();
+      await client.query("BEGIN");
 
-      /*
-       * Check whether the menu item exists.
-       */
-      const itemCheck = await connection.execute(
+      const itemCheck = await client.query(
         `
         SELECT menu_item_id
         FROM menu_items
-        WHERE menu_item_id = :menu_item_id
+        WHERE menu_item_id = $1
+        FOR UPDATE
         `,
-        {
-          menu_item_id: menuItemId,
-        },
-        {
-          outFormat: oracledb.OUT_FORMAT_OBJECT,
-        },
+        [menuItemId],
       );
 
-      if ((itemCheck.rows ?? []).length === 0) {
+      if (itemCheck.rows.length === 0) {
+        await client.query("ROLLBACK");
+
         return res.status(404).json({
           error: "Menu item not found.",
         });
@@ -1691,32 +1566,22 @@ router.delete(
        * Do not physically delete an item that has already
        * been included in an order.
        */
-      const orderCheck = await connection.execute(
+      const orderCheck = await client.query(
         `
         SELECT COUNT(*) AS order_count
         FROM order_lines
-        WHERE menu_item_id = :menu_item_id
+        WHERE menu_item_id = $1
         `,
-        {
-          menu_item_id: menuItemId,
-        },
-        {
-          outFormat: oracledb.OUT_FORMAT_OBJECT,
-        },
+        [menuItemId],
       );
 
       const orderCount = Number(
-        (orderCheck.rows?.[0] as {
-          ORDER_COUNT?: number;
-          order_count?: number;
-        })?.ORDER_COUNT ??
-          (orderCheck.rows?.[0] as {
-            order_count?: number;
-          })?.order_count ??
-          0,
+        orderCheck.rows[0]?.order_count ?? 0,
       );
 
       if (orderCount > 0) {
+        await client.query("ROLLBACK");
+
         return res.status(409).json({
           error:
             "This menu item cannot be deleted because it has already been used in an order.",
@@ -1726,47 +1591,38 @@ router.delete(
       /*
        * Remove dependent records first.
        */
-      await connection.execute(
+      await client.query(
         `
         DELETE FROM item_ingredients
-        WHERE menu_item_id = :menu_item_id
+        WHERE menu_item_id = $1
         `,
-        {
-          menu_item_id: menuItemId,
-        },
+        [menuItemId],
       );
 
-      await connection.execute(
+      await client.query(
         `
         DELETE FROM stock
-        WHERE menu_item_id = :menu_item_id
+        WHERE menu_item_id = $1
         `,
-        {
-          menu_item_id: menuItemId,
-        },
+        [menuItemId],
       );
 
-      /*
-       * Finally remove the menu item.
-       */
-      await connection.execute(
+      await client.query(
         `
         DELETE FROM menu_items
-        WHERE menu_item_id = :menu_item_id
+        WHERE menu_item_id = $1
         `,
-        {
-          menu_item_id: menuItemId,
-        },
+        [menuItemId],
       );
 
-      await connection.commit();
+      await client.query("COMMIT");
 
       return res.json({
         message: "Menu item deleted successfully.",
         menuItemId,
       });
     } catch (error) {
-      await connection?.rollback();
+      await client.query("ROLLBACK");
 
       console.error("Delete menu item error:", error);
 
@@ -1774,9 +1630,7 @@ router.delete(
         error: "Failed to delete menu item.",
       });
     } finally {
-      if (connection) {
-        await connection.close();
-      }
+      client.release();
     }
   },
 );

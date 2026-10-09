@@ -1,36 +1,36 @@
-import oracledb from "oracledb";
 import dotenv from "dotenv";
 import fs from "fs";
+import path from "path";
+import { pool } from "./db.js";
 
 dotenv.config();
 
-const sql = fs.readFileSync(
-  "../database/plsql/02_queue_cursor.sql",
-  "utf8"
+const sqlPath = path.resolve(
+  process.cwd(),
+  "../database/postgresql/04_queue_function.sql"
 );
 
-const statements = sql
-  .split(/\n\s*\/\s*(?:\r?\n|$)/)
-  .map(statement => statement.trim())
-  .filter(Boolean);
+const sql = fs.readFileSync(sqlPath, "utf8");
 
-const connection = await oracledb.getConnection({
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  connectString: process.env.DB_CONNECT_STRING
-});
+async function main() {
+  const client = await pool.connect();
 
-try {
-  for (const statement of statements) {
-    await connection.execute(statement);
+  try {
+    await client.query("BEGIN");
+
+    await client.query(sql);
+
+    await client.query("COMMIT");
+
+    console.log("Installed: 04_queue_function.sql");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    process.exitCode = 1;
+  } finally {
+    client.release();
+    await pool.end();
   }
-
-  await connection.commit();
-  console.log("Installed: 02_queue_cursor.sql");
-} catch (error) {
-  await connection.rollback();
-  console.error(error);
-  process.exitCode = 1;
-} finally {
-  await connection.close();
 }
+
+main().catch(console.error);

@@ -1,10 +1,14 @@
-import oracledb from "oracledb";
+import pg from "pg";
 import dotenv from "dotenv";
 
 dotenv.config();
 
-export const pool = await oracledb.createPool({
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  connectString: process.env.DB_CONNECT_STRING
+const { Pool } = pg;
+
+export const pool = new Pool({
+  host: process.env.DB_HOST || "localhost",
+  port: Number(process.env.DB_PORT) || 5432,
+  database: process.env.DB_NAME || "cafeteria",
+  user: process.env.DB_USER || "cafeteria",
+  password: process.env.DB_PASSWORD || "cafeteria123",
 });

@@ -1,38 +1,39 @@
-import oracledb from "oracledb";
 import dotenv from "dotenv";
 import fs from "fs";
+import path from "path";
+import { pool } from "./db.js";
 
 dotenv.config();
 
-const sql = fs.readFileSync("../database/seed/01_seed_data.sql", "utf8");
+const sqlPath = path.resolve(
+  process.cwd(),
+  "../database/postgresql/02_seed_data.sql"
+);
 
-const cleanedSql = sql
-  .split(/\r?\n/)
-  .filter(line => !line.trim().startsWith("--"))
-  .join("\n");
+const sql = fs.readFileSync(sqlPath, "utf8");
 
-const statements = cleanedSql
-  .split(";")
-  .map(s => s.trim())
-  .filter(Boolean);
+async function main() {
+  const client = await pool.connect();
 
-const connection = await oracledb.getConnection({
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  connectString: process.env.DB_CONNECT_STRING
-});
+  try {
+    await client.query("BEGIN");
 
-try {
-  for (const statement of statements) {
-    await connection.execute(statement);
+    console.log("Executing PostgreSQL seed data...");
+
+    await client.query(sql);
+
+    await client.query("COMMIT");
+
+    console.log("Seed data inserted successfully.");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("Seed data insertion failed:");
+    console.error(error);
+    process.exitCode = 1;
+  } finally {
+    client.release();
+    await pool.end();
   }
-
-  await connection.commit();
-  console.log("Seed data inserted successfully.");
-} catch (error) {
-  await connection.rollback();
-  console.error(error);
-  process.exitCode = 1;
-} finally {
-  await connection.close();
 }
+
+main().catch(console.error);

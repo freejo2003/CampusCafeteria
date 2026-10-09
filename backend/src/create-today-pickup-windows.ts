@@ -1,15 +1,9 @@
-import oracledb from "oracledb";
 import dotenv from "dotenv";
+import { pool } from "./db.js";
 
 dotenv.config();
 
 async function main() {
-  const connection = await oracledb.getConnection({
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    connectString: process.env.DB_CONNECT_STRING
-  });
-
   try {
     const windows = [
       ["12:00", "12:30"],
@@ -18,7 +12,7 @@ async function main() {
     ];
 
     for (const [startTime, endTime] of windows) {
-      await connection.execute(
+      await pool.query(
         `
         INSERT INTO pickup_windows (
           window_date,
@@ -28,24 +22,20 @@ async function main() {
           reserved_count
         )
         VALUES (
-          TO_DATE('2026-10-03', 'YYYY-MM-DD'),
-          TO_DATE('2026-10-03 ${startTime}', 'YYYY-MM-DD HH24:MI'),
-          TO_DATE('2026-10-03 ${endTime}', 'YYYY-MM-DD HH24:MI'),
+          $1::date,
+          $2::time,
+          $3::time,
           20,
           0
         )
-        `
+        `,
+        ["2026-10-03", startTime, endTime]
       );
     }
 
-    await connection.commit();
-
     console.log("Created pickup windows for 2026-10-03.");
-  } catch (error) {
-    await connection.rollback();
-    throw error;
   } finally {
-    await connection.close();
+    await pool.end();
   }
 }
 

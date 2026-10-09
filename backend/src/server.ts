@@ -28,10 +28,7 @@ app.use("/api/users", usersRouter);
 
 app.get("/api/health", async (_req, res) => {
   try {
-    const connection = await pool.getConnection();
-
-    await connection.execute("SELECT 1 FROM dual");
-    await connection.close();
+    await pool.query("SELECT 1");
 
     res.json({
       status: "ok",

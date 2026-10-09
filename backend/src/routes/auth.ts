@@ -1,6 +1,5 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
-import oracledb from "oracledb";
 import { pool } from "../db.js";
 import jwt from "jsonwebtoken";
 
@@ -21,76 +20,70 @@ router.post("/register", async (req, res) => {
         });
     }
 
-    const connection = await pool.getConnection();
+    const client = await pool.connect();
 
     try {
         const normalizedEmail = String(email).trim().toLowerCase();
         const normalizedName = String(fullName).trim();
 
-        const existingUser = await connection.execute(
+        const existingUser = await client.query(
             `SELECT user_id
-       FROM users
-       WHERE LOWER(email) = :email`,
-            { email: normalizedEmail }
+             FROM users
+             WHERE LOWER(email) = $1`,
+            [normalizedEmail]
         );
 
-        if ((existingUser.rows?.length ?? 0) > 0) {
+        if (existingUser.rows.length > 0) {
             return res.status(409).json({
                 error: "Email is already registered"
             });
         }
 
-        const roleResult = await connection.execute<[number]>(
+        const roleResult = await client.query(
             `SELECT role_id
-       FROM roles
-       WHERE role_name = 'STUDENT'`
+             FROM roles
+             WHERE role_name = 'STUDENT'`
         );
 
-        if (!roleResult.rows?.length) {
+        if (roleResult.rows.length === 0) {
             return res.status(500).json({
                 error: "STUDENT role not found"
             });
         }
 
-        const roleId = roleResult.rows[0][0];
+        const roleId = roleResult.rows[0].role_id;
 
         const passwordHash = await bcrypt.hash(password, 12);
 
-        const result = await connection.execute(
+        const result = await client.query(
             `INSERT INTO users
-       (
-         role_id,
-         full_name,
-         email,
-         password_hash,
-         is_active
-       )
-       VALUES
-       (
-         :role_id,
-         :full_name,
-         :email,
-         :password_hash,
-         'Y'
-       )
-       RETURNING user_id INTO :user_id`,
-            {
-                role_id: roleId,
-                full_name: normalizedName,
-                email: normalizedEmail,
-                password_hash: passwordHash,
-                user_id: {
-                    dir: oracledb.BIND_OUT,
-                    type: oracledb.NUMBER
-                }
-            }
+             (
+                 role_id,
+                 full_name,
+                 email,
+                 password_hash,
+                 is_active
+             )
+             VALUES
+             (
+                 $1,
+                 $2,
+                 $3,
+                 $4,
+                 'Y'
+             )
+             RETURNING user_id`,
+            [
+                roleId,
+                normalizedName,
+                normalizedEmail,
+                passwordHash
+            ]
         );
 
-        await connection.commit();
+        await client.query("COMMIT");
 
-        const userId = result.outBinds
-            ? (result.outBinds as { user_id: number }).user_id
-            : null;
+        const userId = result.rows[0].user_id;
 
         return res.status(201).json({
             message: "Registration successful",
@@ -101,7 +94,7 @@ router.post("/register", async (req, res) => {
         });
 
     } catch (error) {
-        await connection.rollback();
+        await client.query("ROLLBACK");
 
         console.error("REGISTRATION ERROR:");
         console.error(error);
@@ -111,7 +104,7 @@ router.post("/register", async (req, res) => {
         });
 
     } finally {
-        await connection.close();
+        client.release();
     }
 });
 
@@ -124,51 +117,40 @@ router.post("/login", async (req, res) => {
         });
     }
 
-    const connection = await pool.getConnection();
+    const client = await pool.connect();
 
     try {
         const normalizedEmail = String(email).trim().toLowerCase();
 
-        const result = await connection.execute(
+        const result = await client.query(
             `SELECT
-         u.user_id,
-         u.full_name,
-         u.email,
-         u.password_hash,
-         u.is_active,
-         r.role_name
-       FROM users u
-       JOIN roles r
-         ON r.role_id = u.role_id
-       WHERE LOWER(u.email) = :email`,
-            {
-                email: normalizedEmail
-            }
+                 u.user_id,
+                 u.full_name,
+                 u.email,
+                 u.password_hash,
+                 u.is_active,
+                 r.role_name
+             FROM users u
+             JOIN roles r
+                 ON r.role_id = u.role_id
+             WHERE LOWER(u.email) = $1`,
+            [normalizedEmail]
         );
 
-        if (!result.rows?.length) {
+        if (result.rows.length === 0) {
             return res.status(401).json({
                 error: "Invalid email or password"
             });
         }
 
-        const row = result.rows[0] as [
-            number,
-            string,
-            string,
-            string,
-            string,
-            string
-        ];
+        const row = result.rows[0];
 
-        const [
-            userId,
-            fullName,
-            userEmail,
-            passwordHash,
-            isActive,
-            role
-        ] = row;
+        const userId = row.user_id;
+        const fullName = row.full_name;
+        const userEmail = row.email;
+        const passwordHash = row.password_hash;
+        const isActive = row.is_active;
+        const role = row.role_name;
 
         if (isActive !== "Y") {
             return res.status(403).json({
@@ -221,7 +203,7 @@ router.post("/login", async (req, res) => {
         });
 
     } finally {
-        await connection.close();
+        client.release();
     }
 });
 

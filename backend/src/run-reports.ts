@@ -1,26 +1,26 @@
-import oracledb from "oracledb";
+import pg from "pg";
 import dotenv from "dotenv";
 
 dotenv.config();
 
-const connection = await oracledb.getConnection({
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  connectString: process.env.DB_CONNECT_STRING
-});
+const { Pool } = pg;
 
-const options = {
-  outFormat: oracledb.OUT_FORMAT_OBJECT
-};
+const pool = new Pool({
+  host: process.env.DB_HOST || "localhost",
+  port: Number(process.env.DB_PORT) || 5432,
+  database: process.env.DB_NAME || "cafeteria",
+  user: process.env.DB_USER || "cafeteria",
+  password: process.env.DB_PASSWORD || "cafeteria123",
+});
 
 async function runReport(title: string, sql: string) {
   console.log("\n========================================");
   console.log(title);
   console.log("========================================");
 
-  const result = await connection.execute(sql, [], options);
+  const result = await pool.query(sql);
 
-  console.table(result.rows ?? []);
+  console.table(result.rows);
 }
 
 /* 1. ORDER DETAILS */
@@ -42,7 +42,7 @@ await runReport(
   JOIN pickup_windows pw
       ON pw.pickup_window_id = o.pickup_window_id
   ORDER BY o.order_id
-  `
+  `,
 );
 
 /* 2. ORDER COUNT BY STATUS */
@@ -55,7 +55,7 @@ await runReport(
   FROM orders
   GROUP BY order_status
   ORDER BY order_status
-  `
+  `,
 );
 
 /* 3. REVENUE BY PICKUP WINDOW */
@@ -67,7 +67,7 @@ await runReport(
       pw.start_time AS "Pickup Start",
       pw.end_time AS "Pickup End",
       COUNT(o.order_id) AS "Order Count",
-      NVL(
+      COALESCE(
           SUM(
               CASE
                   WHEN o.order_status <> 'CANCELLED'
@@ -85,7 +85,7 @@ await runReport(
       pw.start_time,
       pw.end_time
   ORDER BY pw.pickup_window_id
-  `
+  `,
 );
 
 /* 4. TOP-SELLING MENU ITEMS */
@@ -106,7 +106,7 @@ await runReport(
       mi.menu_item_id,
       mi.item_name
   ORDER BY "Quantity Sold" DESC
-  `
+  `,
 );
 
 /* 5. ITEMS ABOVE AVERAGE PRICE */
@@ -123,7 +123,7 @@ await runReport(
       FROM menu_items
   )
   ORDER BY price DESC
-  `
+  `,
 );
 
 /* 6. STUDENTS WITH AT LEAST ONE ORDER */
@@ -144,7 +144,7 @@ await runReport(
         WHERE o.user_id = u.user_id
     )
   ORDER BY u.user_id
-  `
+  `,
 );
 
 /* 7. MENU ITEMS WITH INGREDIENTS */
@@ -162,7 +162,7 @@ await runReport(
   ORDER BY
       mi.item_name,
       i.ingredient_name
-  `
+  `,
 );
 
 /* 8. STOCK REPORT */
@@ -177,8 +177,10 @@ await runReport(
   FROM stock s
   JOIN menu_items mi
       ON mi.menu_item_id = s.menu_item_id
-  ORDER BY s.available_qty ASC, mi.item_name
-  `
+  ORDER BY
+      s.available_qty ASC,
+      mi.item_name
+  `,
 );
 
 /* 9. PICKUP-WINDOW UTILIZATION */
@@ -193,12 +195,15 @@ await runReport(
       pw.reserved_count AS "Reserved",
       pw.capacity - pw.reserved_count AS "Available",
       ROUND(
-          (pw.reserved_count / pw.capacity) * 100,
+          (
+              pw.reserved_count::numeric
+              / NULLIF(pw.capacity, 0)
+          ) * 100,
           2
       ) AS "Utilization %"
   FROM pickup_windows pw
   ORDER BY pw.pickup_window_id
-  `
+  `,
 );
 
 /* 10. STUDENT ORDER SUMMARY */
@@ -209,7 +214,7 @@ await runReport(
       u.user_id AS "User ID",
       u.full_name AS "Student Name",
       COUNT(o.order_id) AS "Total Orders",
-      NVL(
+      COALESCE(
           SUM(
               CASE
                   WHEN o.order_status <> 'CANCELLED'
@@ -229,7 +234,7 @@ await runReport(
       u.user_id,
       u.full_name
   ORDER BY u.user_id
-  `
+  `,
 );
 
-await connection.close();
+await pool.end();
