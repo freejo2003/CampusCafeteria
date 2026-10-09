@@ -11,4 +11,7 @@ export const pool = new Pool({
   database: process.env.DB_NAME || "cafeteria",
   user: process.env.DB_USER || "cafeteria",
   password: process.env.DB_PASSWORD || "cafeteria123",
+  ssl: {
+    rejectUnauthorized: false,
+  },
 });
